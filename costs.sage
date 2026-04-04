@@ -50,12 +50,17 @@ msg_size = 32  # Model a 256-bit message digest in Hmsg/PRFmsg
 # Sources: evm.codes (opcode costs), EIP-7623, EIP-7976.
 GAS_KECCAK_BASE = 30
 GAS_KECCAK_PER_WORD = 6
+TX_BASE_GAS = 21_000
 GAS_CALLDATA_STANDARD_ZERO = 4
 GAS_CALLDATA_STANDARD_NONZERO = 16
 GAS_CALLDATA_7623_FLOOR_PER_TOKEN = 10
 GAS_CALLDATA_7976_FLOOR_PER_BYTE = 64
 GAS_CALLDATA_60_15_NONZERO = 60
 GAS_CALLDATA_60_15_ZERO = 15
+ASM_MODEL_INTERCEPT = 36117.58115183245
+ASM_MODEL_PER_OP = 194.2041884816754
+PORS_CORE_TREE_H_WEIGHT = 5
+PORS_CORE_CONST = 27
 
 # Hash throughput assumption for rough CPU-time estimates (keccak calls per second).
 # Override via KECCAKS_PER_SEC env var.
@@ -221,6 +226,13 @@ def env_str_tuple(name, default):
         return ()
     return tuple(part.strip() for part in value.split(",") if part.strip())
 
+def env_str(name, default):
+    """Parse a string environment variable with fallback."""
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip()
+
 # =============================================================================
 # Parameter Sets
 # =============================================================================
@@ -348,6 +360,13 @@ def compute_pors_tree_geometry(k, a):
     subtree_height = floor(log(t, 2))
     extra_leaves = t - 2**subtree_height
     return t, subtree_height, extra_leaves
+
+def ceil_log2_int(x):
+    """Ceiling of log2 for positive integers."""
+    x = int(x)
+    if x <= 1:
+        return 0
+    return int(ceil(log(x, 2)))
 
 def log2_exp_work_from_mmax(t, k, mmax):
     """Look up log2 of expected work for PORS+FP grinding given mmax."""
@@ -680,6 +699,40 @@ def compute_verification_time(h, d, a, k, w, swn, scheme, mmax=0):
         'keccak_gas': gas_hmsg + gas_fts + d*gas_wots + h*gas_th2,
     }
 
+def estimate_contract_verify_gas(h, d, a, k, w, swn, scheme, mmax=0):
+    """
+    Calibrated verifier execution-gas estimate for the Solidity/Yul implementation.
+
+    This augments the raw keccak-opcode model with loop/control/memory overhead by
+    fitting a coarse operation proxy to measured verifier gas. The calibration is
+    strongest for W+C_F+C and W+C_P+FP, and is used as a pragmatic whole-cost model
+    for nearby schemes.
+    """
+    if scheme == "FORS_MERKLE":
+        core = k * (a + 1) + 3 + h
+        ops = core
+    else:
+        assert h % d == 0, "h must be divisible by d"
+        l = compute_wots_l(scheme, w)
+        subtree_h = h // d
+        if scheme == "SPX":
+            wots_verify_ops = (w - 1) * l // 2 + 1
+        else:
+            wots_verify_ops = (w - 1) * l - swn + 2
+        hypertree_term = d * (wots_verify_ops + subtree_h)
+
+        if scheme == "W+C_F+C":
+            core = (k - 1) * (a + 1) + 3
+        elif scheme == "W+C_P+FP":
+            tree_height = ceil_log2_int(k * (2**a))
+            core = 2 * mmax + k + PORS_CORE_TREE_H_WEIGHT * tree_height + PORS_CORE_CONST
+        else:
+            core = k * (a + 1) + 3
+        ops = core + hypertree_term
+
+    g = ASM_MODEL_INTERCEPT + ASM_MODEL_PER_OP * ops
+    return max(0, int(round(g)))
+
 def compute_keygen_cost(h, d, a, k, w, scheme):
     """
     Estimate keygen cost in keccak calls and keccak gas.
@@ -737,6 +790,8 @@ def compute_all_results():
         size = compute_size(h, d, a, k, w, scheme, sign['mmax'])
         calldata_zero_bytes = int(size * DEFAULT_CALLDATA_ZERO_FRACTION)
         gas_model = compute_total_verify_gas(size, verify['keccak_gas'], zero_bytes=calldata_zero_bytes)
+        contract_verify_gas = estimate_contract_verify_gas(h, d, a, k, w, swn, scheme, sign['mmax'])
+        contract_gas_model = compute_total_verify_gas(size, contract_verify_gas, zero_bytes=calldata_zero_bytes)
         keccak_gas_per_byte = float(verify['keccak_gas']) / float(size)
         keygen = compute_keygen_cost(h, d, a, k, w, scheme)
 
@@ -757,8 +812,14 @@ def compute_all_results():
             'worst_search': sign['worst_search'],
             'verify_hashes': verify['hashes'],
             'verify_keccak_gas': verify['keccak_gas'],
+            'verify_contract_gas': contract_verify_gas,
             'keccak_gas_per_byte': keccak_gas_per_byte,
             **gas_model,
+            'total_verify_contract_gas': contract_gas_model['total_verify_gas'],
+            'contract_gas_path': contract_gas_model['gas_path'],
+            'contract_standard_plus_compute_gas': contract_gas_model['standard_plus_compute_gas'],
+            'tx_total_keccak_gas': gas_model['total_verify_gas'] + TX_BASE_GAS,
+            'tx_total_contract_gas': contract_gas_model['total_verify_gas'] + TX_BASE_GAS,
             'sign_seconds': estimate_time_seconds(sign['hashes']),
             'verify_seconds': estimate_time_seconds(verify['hashes']),
             'keygen_seconds': estimate_time_seconds(keygen['hashes']) if keygen['hashes'] else 0.0,
@@ -813,6 +874,7 @@ def search_evm_candidates(
     scheme_names=("W+C", "W+C_F+C", "W+C_P+FP", "SPX", "FORS_MERKLE"),
     force_schemes=("W+C_P+FP", "W+C", "FORS_MERKLE"),
     keccaks_per_sec=DEFAULT_KECCAKS_PER_SEC,
+    gas_metric="contract",
 ):
     """
     Search for candidate parameter sets under EVM constraints.
@@ -863,13 +925,22 @@ def search_evm_candidates(
 
                                     calldata_zero_bytes = int(size * DEFAULT_CALLDATA_ZERO_FRACTION)
                                     gas_model = compute_total_verify_gas(size, verify['keccak_gas'], zero_bytes=calldata_zero_bytes)
-                                    total_gas = gas_model['total_verify_gas']
+                                    contract_verify_gas = estimate_contract_verify_gas(h, d, a, k, w, swn, scheme, sign['mmax'])
+                                    contract_gas_model = compute_total_verify_gas(size, contract_verify_gas, zero_bytes=calldata_zero_bytes)
+                                    if gas_metric == "contract":
+                                        selected_total_gas = contract_gas_model['total_verify_gas']
+                                        selected_tx_gas = contract_gas_model['total_verify_gas'] + TX_BASE_GAS
+                                        selected_gas_path = contract_gas_model['gas_path']
+                                    else:
+                                        selected_total_gas = gas_model['total_verify_gas']
+                                        selected_tx_gas = gas_model['total_verify_gas'] + TX_BASE_GAS
+                                        selected_gas_path = gas_model['gas_path']
 
                                     sign_s = estimate_time_seconds(sign['hashes'], keccaks_per_sec)
                                     verify_s = estimate_time_seconds(verify['hashes'], keccaks_per_sec)
                                     if sign_s > sign_time_limit or verify_s > verify_time_limit:
                                         continue
-                                    if total_gas > gas_limit:
+                                    if selected_total_gas > gas_limit:
                                         continue
                                     sec_tuned = security_cached(tuned_qs, h, k, a, scheme_type)
                                     if sec_tuned < target_security_bits:
@@ -891,7 +962,15 @@ def search_evm_candidates(
                                         'sign_seconds': sign_s,
                                         'verify_seconds': verify_s,
                                         'verify_keccak_gas': verify['keccak_gas'],
+                                        'verify_contract_gas': contract_verify_gas,
                                         **gas_model,
+                                        'total_verify_contract_gas': contract_gas_model['total_verify_gas'],
+                                        'contract_gas_path': contract_gas_model['gas_path'],
+                                        'tx_total_keccak_gas': gas_model['total_verify_gas'] + TX_BASE_GAS,
+                                        'tx_total_contract_gas': contract_gas_model['total_verify_gas'] + TX_BASE_GAS,
+                                        'selected_total_gas': selected_total_gas,
+                                        'selected_tx_gas': selected_tx_gas,
+                                        'selected_gas_path': selected_gas_path,
                                         'sec_tuned': sec_tuned,
                                         'keygen_seconds': keygen_s,
                                         'mmax': sign['mmax'],
@@ -912,13 +991,22 @@ def search_evm_candidates(
 
                             calldata_zero_bytes = int(size * DEFAULT_CALLDATA_ZERO_FRACTION)
                             gas_model = compute_total_verify_gas(size, verify['keccak_gas'], zero_bytes=calldata_zero_bytes)
-                            total_gas = gas_model['total_verify_gas']
+                            contract_verify_gas = estimate_contract_verify_gas(h, d, a, k, w, swn, scheme, sign['mmax'])
+                            contract_gas_model = compute_total_verify_gas(size, contract_verify_gas, zero_bytes=calldata_zero_bytes)
+                            if gas_metric == "contract":
+                                selected_total_gas = contract_gas_model['total_verify_gas']
+                                selected_tx_gas = contract_gas_model['total_verify_gas'] + TX_BASE_GAS
+                                selected_gas_path = contract_gas_model['gas_path']
+                            else:
+                                selected_total_gas = gas_model['total_verify_gas']
+                                selected_tx_gas = gas_model['total_verify_gas'] + TX_BASE_GAS
+                                selected_gas_path = gas_model['gas_path']
 
                             sign_s = estimate_time_seconds(sign['hashes'], keccaks_per_sec)
                             verify_s = estimate_time_seconds(verify['hashes'], keccaks_per_sec)
                             if sign_s > sign_time_limit or verify_s > verify_time_limit:
                                 continue
-                            if total_gas > gas_limit:
+                            if selected_total_gas > gas_limit:
                                 continue
                             sec_tuned = security_cached(tuned_qs, h, k, a, scheme_type)
                             if sec_tuned < target_security_bits:
@@ -940,13 +1028,21 @@ def search_evm_candidates(
                                 'sign_seconds': sign_s,
                                 'verify_seconds': verify_s,
                                 'verify_keccak_gas': verify['keccak_gas'],
+                                'verify_contract_gas': contract_verify_gas,
                                 **gas_model,
+                                'total_verify_contract_gas': contract_gas_model['total_verify_gas'],
+                                'contract_gas_path': contract_gas_model['gas_path'],
+                                'tx_total_keccak_gas': gas_model['total_verify_gas'] + TX_BASE_GAS,
+                                'tx_total_contract_gas': contract_gas_model['total_verify_gas'] + TX_BASE_GAS,
+                                'selected_total_gas': selected_total_gas,
+                                'selected_tx_gas': selected_tx_gas,
+                                'selected_gas_path': selected_gas_path,
                                 'sec_tuned': sec_tuned,
                                 'keygen_seconds': keygen_s,
                                 'mmax': sign['mmax'],
                             })
 
-    results.sort(key=lambda r: (r['total_verify_gas'], r['size'], r['verify_seconds']))
+    results.sort(key=lambda r: (r['selected_total_gas'], r['size'], r['verify_seconds']))
 
     if not force_schemes:
         return results[:max_rows]
@@ -994,6 +1090,7 @@ def generate_research_table(max_rows=20, force_schemes=("W+C_P+FP", "W+C", "FORS
         'tuned_log_qs': tuned_log_qs,
         'report_log_qs': report_log_qs,
         'target_security_bits': env_float("RESEARCH_TARGET_SECURITY", 128),
+        'gas_metric': env_str("RESEARCH_GAS_METRIC", "contract"),
     }
     rows = search_evm_candidates(**search_kwargs)
     if not rows:
@@ -1004,7 +1101,7 @@ def generate_research_table(max_rows=20, force_schemes=("W+C_P+FP", "W+C", "FORS
     print()
     print(f"EVM constraints: {calldata_model_label(DEFAULT_CALLDATA_MODEL)}, Keccak-only hash model, n=16")
     print(f"Assumptions: KECCAKS_PER_SEC={DEFAULT_KECCAKS_PER_SEC:,.0f}, CALLDATA_ZERO_FRACTION={DEFAULT_CALLDATA_ZERO_FRACTION:.2f}")
-    print(f"Search: schemes={search_kwargs['scheme_names']}, d={search_kwargs['d_values']}, sign<= {search_kwargs['sign_time_limit']:.2f}s, verify<= {search_kwargs['verify_time_limit']:.2f}s, gas<= {search_kwargs['gas_limit']}")
+    print(f"Search: schemes={search_kwargs['scheme_names']}, d={search_kwargs['d_values']}, sign<= {search_kwargs['sign_time_limit']:.2f}s, verify<= {search_kwargs['verify_time_limit']:.2f}s, gas<= {search_kwargs['gas_limit']}, gas_metric={search_kwargs['gas_metric']}")
     print(f"Ranges: h_d1=[{search_kwargs['min_h_d1']},{search_kwargs['max_h_d1']}], h_other=[{search_kwargs['min_h_other']},{search_kwargs['max_h_other']}], a={search_kwargs['a_values']}, k={search_kwargs['k_values']}, w={search_kwargs['w_values']}")
     print(f"Security columns: {tuple(f'2^{q}' for q in report_log_qs)}")
     print()
@@ -1019,11 +1116,13 @@ def generate_research_table(max_rows=20, force_schemes=("W+C_P+FP", "W+C", "FORS
         ("Size", 'size', 6, str),
         ("Sign(s)", 'sign_seconds', 7, lambda x: f"{x:.2f}"),
         ("Verify(s)", 'verify_seconds', 9, lambda x: f"{x:.2f}"),
-        ("Gas", 'total_verify_gas', 8, format_num),
-        ("Path", 'gas_path', 6, str),
+        ("Gas", 'selected_total_gas', 8, format_num),
+        ("TxGas", 'selected_tx_gas', 8, format_num),
+        ("Path", 'selected_gas_path', 6, str),
         ("Floor", 'calldata_floor_gas', 8, format_num),
         ("StdData", 'standard_calldata_gas', 8, format_num),
-        ("Compute", 'verify_keccak_gas', 8, format_num),
+        ("ExecGas", 'verify_contract_gas', 8, format_num),
+        ("Keccak", 'verify_keccak_gas', 8, format_num),
         ("Keygen(s)", 'keygen_seconds', 9, lambda x: f"{x:.2f}"),
     ]
     sec_columns = [(f"Sec@2^{q}", f"sec_{q}", 9, lambda x: f"{x:.1f}") for q in report_log_qs]
@@ -1043,7 +1142,7 @@ def generate_research_table(max_rows=20, force_schemes=("W+C_P+FP", "W+C", "FORS
         print(" ".join(row_parts))
 
     print()
-    print(f"Legend: Gas excludes 21k base tx cost and memory expansion; {gas_formula_legend(DEFAULT_CALLDATA_MODEL)}")
+    print(f"Legend: Gas excludes 21k base tx cost and memory expansion; TxGas = Gas + 21k; {gas_formula_legend(DEFAULT_CALLDATA_MODEL)}")
     if search_kwargs['force_schemes']:
         present = {r['scheme'] for r in rows}
         missing = [s for s in search_kwargs['force_schemes'] if s not in present]
