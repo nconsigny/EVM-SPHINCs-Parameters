@@ -261,7 +261,3 @@ That is why the repository emphasizes:
 - `d = 2` / `d = 3` / `d = 4` tradeoffs
 - `w = 16` / `w = 32` as the likely sweet spot
 - comparison between live-mainnet `EIP-7623` and draft `EIP-7976`
-
-## License / Upstream Attribution
-
-Please keep upstream attribution when publishing derivative work based on the Blockstream Research repository and on the bundled external helper code.
