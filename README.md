@@ -1,6 +1,6 @@
-# EVM-SPHINCS-Parameters
+# EVM-SPHINCs-Parameters
 
-`EVM-SPHINCS-Parameters` is an EVM-oriented adaptation of the Blockstream Research repository [`SPHINCS-Parameters`](https://github.com/BlockstreamResearch/SPHINCS-Parameters).
+`EVM-SPHINCs-Parameters` is an EVM-oriented adaptation of the Blockstream Research repository [`SPHINCS-Parameters`](https://github.com/BlockstreamResearch/SPHINCS-Parameters).
 
 The original repository is a SageMath toolbox for exploring SPHINCS+ parameter tradeoffs. This fork keeps that research base, but repurposes it for Keccak-only verification inside the Ethereum Virtual Machine, with emphasis on:
 
