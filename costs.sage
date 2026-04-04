@@ -7,6 +7,7 @@ Computes signature sizes and signing/verification times for SPHINCS+ variants:
 - W+C: SPHINCS+ with WOTS+C (counter-based WOTS, no checksum chains)
 - W+C_F+C: SPHINCS+ with WOTS+C and FORS+C (grinding to remove last FORS tree)
 - W+C_P+FP: SPHINCS+ with WOTS+C and PORS+FP (single tree with Octopus auth)
+- FORS_MERKLE: FORS-only with a single Merkle tree (d=1, no WOTS)
 
 Notation:
 - h: hypertree height (total)
@@ -36,27 +37,189 @@ load(os.path.join(_dir, "security.sage"))
 # =============================================================================
 
 hashbytes = 16  # 16 bytes = 128 bits
-counter_size = 4 # 4 bytes = 32 bits
+counter_size = 4  # 4 bytes = 32 bits
 randomness_size = 32  # 32 bytes = 256 bits
 
-# Compression function calls per hash operation
-# SHA-256 block size = 512 bits, with 65 bits for padding/length
-# Each value = number of compression calls for that operation
-C_Th1 = 1     # Tweakable hash, 1-block: PKseed (128) + Tweak (96) + m1 (128)
-C_Th1c = 1    # Tweakable hash, 1-block + counter: PKseed + Tweak + m1 + counter (32)
-C_Th2 = 2     # Tweakable hash, 2-block: PKseed + Tweak + m1 + m2
-C_Hmsg = 2    # Message hash: PKseed + PKroot (128) + R (256) + m (256)
-C_PRFmsg = 2  # Message PRF: SKprf (128) + Opt + m (256) + counter
-C_PRF = 1     # PRF: PKseed + SKseed + Tweak
+# Fixed input component sizes (bytes)
+tweak_size = 12  # 96-bit tweak
+msg_size = 32  # Model a 256-bit message digest in Hmsg/PRFmsg
 
-def compute_Th(n):
-    """
-    Compute compression calls for tweakable hash of n values.
+# EVM gas schedule (Shanghai/Cancun) for KECCAK256.
+# Calldata defaults to live mainnet EIP-7623 pricing; EIP-7976 draft and a legacy 60/15
+# what-if mode are available via CALLDATA_MODEL.
+# Sources: evm.codes (opcode costs), EIP-7623, EIP-7976.
+GAS_KECCAK_BASE = 30
+GAS_KECCAK_PER_WORD = 6
+GAS_CALLDATA_STANDARD_ZERO = 4
+GAS_CALLDATA_STANDARD_NONZERO = 16
+GAS_CALLDATA_7623_FLOOR_PER_TOKEN = 10
+GAS_CALLDATA_7976_FLOOR_PER_BYTE = 64
+GAS_CALLDATA_60_15_NONZERO = 60
+GAS_CALLDATA_60_15_ZERO = 15
 
-    Input: PKseed (128) + Tweak (96) + n*hashbytes (n*128) + padding (65)
-    SHA-256 block size: 512 bits
+# Hash throughput assumption for rough CPU-time estimates (keccak calls per second).
+# Override via KECCAKS_PER_SEC env var.
+DEFAULT_KECCAKS_PER_SEC = float(os.environ.get("KECCAKS_PER_SEC", 5_000_000))
+DEFAULT_CALLDATA_ZERO_FRACTION = float(os.environ.get("CALLDATA_ZERO_FRACTION", 0.0))
+
+def normalize_calldata_model(value):
+    """Normalize calldata model aliases to a canonical identifier."""
+    model = str(value).strip().lower()
+    aliases = {
+        "7623": "7623",
+        "eip7623": "7623",
+        "mainnet": "7623",
+        "mainnet_7623": "7623",
+        "live": "7623",
+        "live_7623": "7623",
+        "7976": "7976",
+        "eip7976": "7976",
+        "draft": "7976",
+        "draft_7976": "7976",
+        "60_15": "60_15",
+        "legacy": "60_15",
+        "legacy_60_15": "60_15",
+    }
+    if model not in aliases:
+        raise ValueError(f"Unsupported CALLDATA_MODEL={value!r}; expected 7623, 7976, or 60_15")
+    return aliases[model]
+
+DEFAULT_CALLDATA_MODEL = normalize_calldata_model(os.environ.get("CALLDATA_MODEL", "7623"))
+
+def evm_keccak_gas(byte_len):
+    """Gas for KECCAK256 over byte_len bytes (excluding memory expansion)."""
+    return GAS_KECCAK_BASE + GAS_KECCAK_PER_WORD * ceil(byte_len / 32)
+
+def calldata_token_counts(size_bytes, zero_bytes=0):
+    """Return zero bytes, non-zero bytes, and EIP-7623 tokens."""
+    zero_bytes = max(0, min(int(zero_bytes), int(size_bytes)))
+    nonzero = int(size_bytes) - zero_bytes
+    tokens = zero_bytes + 4 * nonzero
+    return zero_bytes, nonzero, tokens
+
+def calldata_standard_gas(size_bytes, zero_bytes=0):
+    """Standard calldata gas at 4/16 (equivalently 4 gas per EIP-7623 token)."""
+    zero_bytes, nonzero, _ = calldata_token_counts(size_bytes, zero_bytes)
+    return zero_bytes * GAS_CALLDATA_STANDARD_ZERO + nonzero * GAS_CALLDATA_STANDARD_NONZERO
+
+def calldata_floor_gas(size_bytes, zero_bytes=0, calldata_model=DEFAULT_CALLDATA_MODEL):
+    """Calldata floor/data gas for the selected pricing model."""
+    zero_bytes, nonzero, tokens = calldata_token_counts(size_bytes, zero_bytes)
+    model = normalize_calldata_model(calldata_model)
+    if model == "7623":
+        return tokens * GAS_CALLDATA_7623_FLOOR_PER_TOKEN
+    if model == "7976":
+        return int(size_bytes) * GAS_CALLDATA_7976_FLOOR_PER_BYTE
+    return nonzero * GAS_CALLDATA_60_15_NONZERO + zero_bytes * GAS_CALLDATA_60_15_ZERO
+
+def calldata_model_label(calldata_model=DEFAULT_CALLDATA_MODEL):
+    """Short human-readable label for the active calldata pricing model."""
+    model = normalize_calldata_model(calldata_model)
+    if model == "7623":
+        return "EIP-7623 mainnet calldata floor"
+    if model == "7976":
+        return "EIP-7976 draft calldata floor"
+    return "legacy 60/15 calldata what-if"
+
+def compute_total_verify_gas(size_bytes, verify_keccak_gas, zero_bytes=0, calldata_model=DEFAULT_CALLDATA_MODEL):
+    """Compute total verification gas under the selected calldata model.
+
+    Returned totals exclude the 21,000 base transaction cost and memory expansion.
     """
-    return ceil((128 + 96 + 128*n + 65)/512)
+    model = normalize_calldata_model(calldata_model)
+    zero_bytes, nonzero, tokens = calldata_token_counts(size_bytes, zero_bytes)
+    standard_data_gas = calldata_standard_gas(size_bytes, zero_bytes)
+    floor_gas = calldata_floor_gas(size_bytes, zero_bytes, model)
+
+    if model == "60_15":
+        total_gas = verify_keccak_gas + floor_gas
+        return {
+            'calldata_model': model,
+            'gas_path': 'legacy',
+            'zero_bytes': zero_bytes,
+            'nonzero_bytes': nonzero,
+            'tokens_in_calldata': tokens,
+            'standard_calldata_gas': standard_data_gas,
+            'calldata_floor_gas': floor_gas,
+            'calldata_gas': floor_gas,
+            'standard_plus_compute_gas': standard_data_gas + verify_keccak_gas,
+            'total_verify_gas': total_gas,
+        }
+
+    standard_plus_compute_gas = standard_data_gas + verify_keccak_gas
+    gas_path = 'floor' if floor_gas >= standard_plus_compute_gas else 'exec'
+    total_gas = max(standard_plus_compute_gas, floor_gas)
+    return {
+        'calldata_model': model,
+        'gas_path': gas_path,
+        'zero_bytes': zero_bytes,
+        'nonzero_bytes': nonzero,
+        'tokens_in_calldata': tokens,
+        'standard_calldata_gas': standard_data_gas,
+        'calldata_floor_gas': floor_gas,
+        'calldata_gas': floor_gas,
+        'standard_plus_compute_gas': standard_plus_compute_gas,
+        'total_verify_gas': total_gas,
+    }
+
+def gas_formula_legend(calldata_model=DEFAULT_CALLDATA_MODEL):
+    """Legend line describing the active gas combination rule."""
+    model = normalize_calldata_model(calldata_model)
+    if model == "60_15":
+        return "Total Gas = Compute + Calldata"
+    return "Total Gas = max(StdData + Compute, Floor)"
+
+def th_bytes(n_values):
+    """Bytes hashed for tweakable hash of n values."""
+    return hashbytes + tweak_size + n_values * hashbytes
+
+def prf_bytes():
+    """Bytes hashed for PRF: PKseed + SKseed + tweak."""
+    return hashbytes + hashbytes + tweak_size
+
+def hmsg_bytes():
+    """Bytes hashed for Hmsg: PKseed + PKroot + R + m."""
+    return 2 * hashbytes + randomness_size + msg_size
+
+def prfmsg_bytes():
+    """Bytes hashed for PRFmsg: SKprf + Opt + m + counter."""
+    return hashbytes + randomness_size + msg_size + counter_size
+
+def estimate_time_seconds(hash_calls, keccaks_per_sec=DEFAULT_KECCAKS_PER_SEC):
+    """Rough CPU time estimate from keccak call counts."""
+    if keccaks_per_sec <= 0:
+        return float("inf")
+    return float(hash_calls) / float(keccaks_per_sec)
+
+def env_float(name, default):
+    """Parse a float environment variable with fallback."""
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
+def env_int(name, default):
+    """Parse an int environment variable with fallback."""
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return int(value)
+
+def env_int_tuple(name, default):
+    """Parse comma-separated ints from an environment variable."""
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+
+def env_str_tuple(name, default):
+    """Parse comma-separated strings from an environment variable."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    if value.strip() == "":
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
 
 # =============================================================================
 # Parameter Sets
@@ -136,6 +299,8 @@ def compute_wots_l(scheme, w):
 
     For WOTS+C: l = l1 (no checksum chains, replaced by counter)
     """
+    if scheme == "FORS_MERKLE":
+        return 0
     if scheme == "SPX":
         l1 = hashbytes*8//log(w,2)
         l2 = ceil(log(l1*(w-1), 2)/log(w, 2))
@@ -260,6 +425,12 @@ def compute_size(h, d, a, k, w, scheme, mmax=0):
 
     mmax: for PORS+FP, max size of the authentication set
     """
+    if scheme == "FORS_MERKLE":
+        assert d == 1, "FORS_MERKLE assumes d=1"
+        # Merkle auth path (h) + FORS signature + randomness
+        fts_size = k*hashbytes + k*a*hashbytes
+        return randomness_size + fts_size + h*hashbytes
+
     assert h % d == 0, "h must be divisible by d"
     has_wc = (scheme != "SPX")
     l = compute_wots_l(scheme, w)
@@ -284,22 +455,29 @@ def compute_mmax(h_prime, l, w, d_wots_expected_search, d, k, a):
 
     mmax is the max size of the authentication set.
     """
-    Thl = compute_Th(l)
-    Thk1 = compute_Th(k-1)  # FORS+C has k-1 roots
-    merkle_tree_fixed_part_time = (2**h_prime * (l*C_PRF + l*(w-1)*C_Th1 + Thl)) + (2**h_prime-1)*C_Th2
-    hyper_tree_expected_time = d*merkle_tree_fixed_part_time + d_wots_expected_search*C_Th1c
-    # Compute FORS+C time to relate PORS time in compression calls
-    fors_c_fixed_part_time = (k-1)*(2**a)*C_PRF + (k-1)*(2**a)*C_Th1 + (k-1)*(2**a-1)*C_Th2 + Thk1
-    fors_c_expected_search_time = 2**a*(C_Hmsg + C_PRFmsg)
+    gas_th1 = evm_keccak_gas(th_bytes(1))
+    gas_th1c = evm_keccak_gas(th_bytes(1) + counter_size)
+    gas_th2 = evm_keccak_gas(th_bytes(2))
+    gas_prf = evm_keccak_gas(prf_bytes())
+    gas_hmsg = evm_keccak_gas(hmsg_bytes())
+    gas_prfmsg = evm_keccak_gas(prfmsg_bytes())
+    gas_thl = evm_keccak_gas(th_bytes(l))
+    gas_thk1 = evm_keccak_gas(th_bytes(k-1))  # FORS+C has k-1 roots
+
+    merkle_tree_fixed_part_time = (2**h_prime * (l*gas_prf + l*(w-1)*gas_th1 + gas_thl)) + (2**h_prime-1)*gas_th2
+    hyper_tree_expected_time = d*merkle_tree_fixed_part_time + d_wots_expected_search*gas_th1c
+    # Compute FORS+C time to relate PORS time in keccak gas
+    fors_c_fixed_part_time = (k-1)*(2**a)*gas_prf + (k-1)*(2**a)*gas_th1 + (k-1)*(2**a-1)*gas_th2 + gas_thk1
+    fors_c_expected_search_time = 2**a*(gas_hmsg + gas_prfmsg)
     fors_c_expected_total_time = fors_c_fixed_part_time + fors_c_expected_search_time
     spx_fc_expected_total_time = hyper_tree_expected_time + fors_c_expected_total_time
     # Search for mmax such that PORS time is close to FORS+C time
     t, subtree_height, extra_leaves = compute_pors_tree_geometry(k, a)
-    pors_fixed_part_time = t*(C_PRF) + t*(C_Th1) + ((2**subtree_height-1) + extra_leaves)*(C_Th2)
+    pors_fixed_part_time = t*gas_prf + t*gas_th1 + ((2**subtree_height-1) + extra_leaves)*gas_th2
     mmax = (k-1)*a - ceil(350/hashbytes)
     for i in range(20):
         pors_search_attempts = ceil(exp_work_from_mmax(t, k, mmax))
-        pors_expected_search_time = pors_search_attempts*(C_Hmsg + C_PRFmsg)
+        pors_expected_search_time = pors_search_attempts*(gas_hmsg + gas_prfmsg)
         pors_expected_total_time = pors_fixed_part_time + pors_expected_search_time
         spx_pors_expected_total_time = hyper_tree_expected_time + pors_expected_total_time
         ratio = spx_pors_expected_total_time/spx_fc_expected_total_time
@@ -309,23 +487,36 @@ def compute_mmax(h_prime, l, w, d_wots_expected_search, d, k, a):
     return mmax
 
 
-def compute_signing_time(h, d, a, k, w, swn, scheme):
+def compute_signing_time(h, d, a, k, w, swn, scheme, include_worst=True):
     """
-    Compute signing time in both hash calls and compression function calls.
+    Compute signing time in both hash calls and keccak gas.
 
     Returns a dict with keys:
-    - 'hashes': expected signing time in hash calls
-    - 'compressions': expected signing time in compression calls
+    - 'hashes': expected signing time in keccak calls
+    - 'keccak_gas': expected signing time in keccak gas (excluding calldata)
     - 'exp_search': expected search attempts
     - 'worst_search': worst-case search attempts
     - 'mmax': mmax value for PORS+FP (max authentication set size)
     """
-    assert h % d == 0, "h must be divisible by d"
-    has_wc = (scheme != "SPX")
-    h_prime = h // d
+    if scheme == "FORS_MERKLE":
+        assert d == 1, "FORS_MERKLE assumes d=1"
+    else:
+        assert h % d == 0, "h must be divisible by d"
+
+    has_wots = (scheme != "FORS_MERKLE")
+    has_wc = (scheme not in ("SPX", "FORS_MERKLE"))
+
+    h_prime = h // d if has_wots else h
     l = compute_wots_l(scheme, w)
-    Thl = compute_Th(l)
-    Thk = compute_Th(k)
+
+    gas_th1 = evm_keccak_gas(th_bytes(1))
+    gas_th1c = evm_keccak_gas(th_bytes(1) + counter_size)
+    gas_th2 = evm_keccak_gas(th_bytes(2))
+    gas_prf = evm_keccak_gas(prf_bytes())
+    gas_hmsg = evm_keccak_gas(hmsg_bytes())
+    gas_prfmsg = evm_keccak_gas(prfmsg_bytes())
+    gas_thl = evm_keccak_gas(th_bytes(l)) if l > 0 else 0
+    gas_thk = evm_keccak_gas(th_bytes(k))
 
     if has_wc:
         # WOTS+C search: find counter such that digest sums to S_{w,n}
@@ -334,31 +525,46 @@ def compute_signing_time(h, d, a, k, w, swn, scheme):
         # We need d successful searches (one per hypertree layer)
         nu = compute_nu(l, swn, w)
         d_wots_expected_search = d*ceil((w**l) / nu)
-        d_wots_worst_search = worst_case(nu/(w**l), F(2)**(-30), d)
+        d_wots_worst_search = worst_case(nu/(w**l), F(2)**(-30), d) if include_worst else 0
     else:
         d_wots_expected_search = 0
         d_wots_worst_search = 0
 
-    # Compute times for both hash calls (h_) and compressions (c_)
-    # One XMSS tree layer with 2^h' leaves:
-    #   - 2^h' WOTS keypairs, each requiring:
-    #       - l PRF calls to generate secret keys
-    #       - l*(w-1) chain hashes (Th1)
-    #       - 1 hash to compress l public key values (Thl)
-    #   - 2^h' - 1 internal Merkle tree nodes (Th2, hashing 2 children)
-    h_merkle = 2**h_prime * (l + l*(w-1) + 1) + (2**h_prime - 1)
-    c_merkle = 2**h_prime * (l*C_PRF + l*(w-1)*C_Th1 + Thl) + (2**h_prime - 1)*C_Th2
-
-    # Full hypertree: d layers + WOTS+C counter search overhead
-    h_hyper_exp = d*h_merkle + d_wots_expected_search
-    c_hyper_exp = d*c_merkle + d_wots_expected_search*C_Th1c
-
     # Message hash cost (2 hash calls: Hmsg + PRFmsg)
     h_msg = 2
-    c_msg = C_Hmsg + C_PRFmsg
+    gas_msg = gas_hmsg + gas_prfmsg
+
+    # Merkle/hypertree component
+    if has_wots:
+        # One XMSS tree layer with 2^h' leaves:
+        #   - 2^h' WOTS keypairs, each requiring:
+        #       - l PRF calls to generate secret keys
+        #       - l*(w-1) chain hashes (Th1)
+        #       - 1 hash to compress l public key values (Thl)
+        #   - 2^h' - 1 internal Merkle tree nodes (Th2, hashing 2 children)
+        h_merkle = 2**h_prime * (l + l*(w-1) + 1) + (2**h_prime - 1)
+        gas_merkle = 2**h_prime * (l*gas_prf + l*(w-1)*gas_th1 + gas_thl) + (2**h_prime - 1)*gas_th2
+
+        # Full hypertree: d layers + WOTS+C counter search overhead
+        h_hyper_exp = d*h_merkle + d_wots_expected_search
+        gas_hyper_exp = d*gas_merkle + d_wots_expected_search*gas_th1c
+    else:
+        # Single Merkle tree over FORS public keys
+        h_fors_pk = k*(2**a) + k*(2**a) + k*(2**a - 1) + 1
+        gas_fors_pk = k*(2**a)*gas_prf + k*(2**a)*gas_th1 + k*(2**a - 1)*gas_th2 + gas_thk
+        h_hyper_exp = 2**h * h_fors_pk + (2**h - 1)
+        gas_hyper_exp = 2**h * gas_fors_pk + (2**h - 1)*gas_th2
 
     mmax = 0
-    if scheme == "W+C_F+C":
+    if scheme == "FORS_MERKLE":
+        return {
+            'hashes': h_hyper_exp + h_msg,
+            'keccak_gas': gas_hyper_exp + gas_msg,
+            'exp_search': 0,
+            'worst_search': 0,
+            'mmax': mmax,
+        }
+    elif scheme == "W+C_F+C":
         # FORS+C: k-1 trees (last tree omitted, grinding ensures first leaf is selected)
         # Each tree has 2^a leaves:
         #   - 2^a PRF calls to generate leaves
@@ -366,16 +572,16 @@ def compute_signing_time(h, d, a, k, w, swn, scheme):
         #   - 2^a - 1 internal nodes (Th2)
         # Plus 1 hash to compress k-1 roots
         # Grinding: search for message hash with last a bits = 0, expected 2^a attempts
-        Thk1 = compute_Th(k-1)  # k-1 roots to compress
+        gas_thk1 = evm_keccak_gas(th_bytes(k-1))
         h_fors_fixed = (k-1)*(2**a) + (k-1)*(2**a) + (k-1)*(2**a - 1) + 1
-        c_fors_fixed = (k-1)*(2**a)*C_PRF + (k-1)*(2**a)*C_Th1 + (k-1)*(2**a - 1)*C_Th2 + Thk1
+        gas_fors_fixed = (k-1)*(2**a)*gas_prf + (k-1)*(2**a)*gas_th1 + (k-1)*(2**a - 1)*gas_th2 + gas_thk1
         fors_exp_search = 2**a
-        fors_worst_search = worst_case(F(1)/F(2**a), F(2)**(-30), 1)
+        fors_worst_search = worst_case(F(1)/F(2**a), F(2)**(-30), 1) if include_worst else 0
         h_fors_search = fors_exp_search * h_msg
-        c_fors_search = fors_exp_search * c_msg
+        gas_fors_search = fors_exp_search * gas_msg
         return {
             'hashes': h_hyper_exp + h_fors_fixed + h_fors_search,
-            'compressions': c_hyper_exp + c_fors_fixed + c_fors_search,
+            'keccak_gas': gas_hyper_exp + gas_fors_fixed + gas_fors_search,
             'exp_search': d_wots_expected_search + h_fors_search,
             'worst_search': d_wots_worst_search + fors_worst_search * h_msg,
             'mmax': mmax,
@@ -387,15 +593,15 @@ def compute_signing_time(h, d, a, k, w, swn, scheme):
         t, subtree_height, extra_leaves = compute_pors_tree_geometry(k, a)
         # t PRF calls + t leaf hashes + internal nodes
         h_pors_fixed = 2*t + (2**subtree_height - 1) + extra_leaves
-        c_pors_fixed = t*C_PRF + t*C_Th1 + ((2**subtree_height - 1) + extra_leaves)*C_Th2
+        gas_pors_fixed = t*gas_prf + t*gas_th1 + ((2**subtree_height - 1) + extra_leaves)*gas_th2
         mmax = compute_mmax(h_prime, l, w, d_wots_expected_search, d, k, a)
         pors_search_attempts = ceil(exp_work_from_mmax(t, k, mmax))
         h_pors_search = pors_search_attempts * h_msg
-        c_pors_search = pors_search_attempts * c_msg
-        pors_worst_search = worst_case(F(1)/pors_search_attempts, F(2)**(-30), 1)
+        gas_pors_search = pors_search_attempts * gas_msg
+        pors_worst_search = worst_case(F(1)/pors_search_attempts, F(2)**(-30), 1) if include_worst else 0
         return {
             'hashes': h_hyper_exp + h_pors_fixed + h_pors_search,
-            'compressions': c_hyper_exp + c_pors_fixed + c_pors_search,
+            'keccak_gas': gas_hyper_exp + gas_pors_fixed + gas_pors_search,
             'exp_search': d_wots_expected_search + h_pors_search,
             'worst_search': d_wots_worst_search + pors_worst_search * h_msg,
             'mmax': mmax,
@@ -404,10 +610,10 @@ def compute_signing_time(h, d, a, k, w, swn, scheme):
         # Plain FORS (SPX or W+C): k trees, each with 2^a leaves
         # No grinding, message hash directly selects k leaf indices
         h_fors_fixed = k*(2**a) + k*(2**a) + k*(2**a - 1) + 1
-        c_fors_fixed = k*(2**a)*C_PRF + k*(2**a)*C_Th1 + k*(2**a - 1)*C_Th2 + Thk
+        gas_fors_fixed = k*(2**a)*gas_prf + k*(2**a)*gas_th1 + k*(2**a - 1)*gas_th2 + gas_thk
         return {
             'hashes': h_fors_fixed + h_msg + h_hyper_exp,
-            'compressions': c_fors_fixed + c_msg + c_hyper_exp,
+            'keccak_gas': gas_fors_fixed + gas_msg + gas_hyper_exp,
             'exp_search': d_wots_expected_search,
             'worst_search': d_wots_worst_search,
             'mmax': mmax,
@@ -415,7 +621,7 @@ def compute_signing_time(h, d, a, k, w, swn, scheme):
 
 def compute_verification_time(h, d, a, k, w, swn, scheme, mmax=0):
     """
-    Compute verification time in both hash calls and compression function calls.
+    Compute verification time in both hash calls and keccak gas.
 
     Verification involves:
     1. Hash the message (Hmsg)
@@ -425,42 +631,90 @@ def compute_verification_time(h, d, a, k, w, swn, scheme, mmax=0):
 
     mmax: for PORS+FP, max size of the authentication set
     """
-    has_wc = (scheme != "SPX")
+    if scheme == "FORS_MERKLE":
+        assert d == 1, "FORS_MERKLE assumes d=1"
+    has_wots = (scheme != "FORS_MERKLE")
+    has_wc = (scheme not in ("SPX", "FORS_MERKLE"))
     l = compute_wots_l(scheme, w)
-    Thl = compute_Th(l)
-    Thk = compute_Th(k)
+
+    gas_th1 = evm_keccak_gas(th_bytes(1))
+    gas_th1c = evm_keccak_gas(th_bytes(1) + counter_size)
+    gas_th2 = evm_keccak_gas(th_bytes(2))
+    gas_hmsg = evm_keccak_gas(hmsg_bytes())
+    gas_prfmsg = evm_keccak_gas(prfmsg_bytes())
+    gas_thl = evm_keccak_gas(th_bytes(l)) if l > 0 else 0
+    gas_thk = evm_keccak_gas(th_bytes(k))
 
     # WOTS verification: complete each chain from signature value to public key
-    if has_wc:
+    if has_wots and has_wc:
         # WOTS+C: chain positions sum to S_{w,n}, so remaining steps = (w-1)*l - S_{w,n}
         # Plus: verify counter hash (Th1c) and compress public key (Thl)
         h_wots = (w-1)*l - swn + 2
-        c_wots = ((w-1)*l - swn)*C_Th1 + C_Th1c + Thl
-    else:  # Plain WOTS
+        gas_wots = ((w-1)*l - swn)*gas_th1 + gas_th1c + gas_thl
+    elif has_wots:  # Plain WOTS
         # Expected chain position is (w-1)/2, so expected remaining steps = (w-1)*l/2
         h_wots = (w-1)*l//2 + 1
-        c_wots = (w-1)*l//2*C_Th1 + Thl
+        gas_wots = (w-1)*l//2*gas_th1 + gas_thl
+    else:
+        h_wots = 0
+        gas_wots = 0
 
     # FTS verification
     if scheme == "W+C_F+C":
         # FORS+C: k-1 leaves to hash, (k-1)*a auth path nodes, 1 root compression
-        Thk1 = compute_Th(k-1)  # k-1 roots to compress
+        gas_thk1 = evm_keccak_gas(th_bytes(k-1))
         h_fts = (k-1) + (k-1)*a + 1
-        c_fts = (k-1)*C_Th1 + (k-1)*a*C_Th2 + Thk1
+        gas_fts = (k-1)*gas_th1 + (k-1)*a*gas_th2 + gas_thk1
     elif scheme == "W+C_P+FP":
         # PORS+FP: k leaves to hash, mmax auth set nodes
         h_fts = k + mmax
-        c_fts = k*C_Th1 + mmax*C_Th2
-    else:  # Plain FORS (SPX or W+C)
+        gas_fts = k*gas_th1 + mmax*gas_th2
+    else:  # Plain FORS (SPX or W+C, or FORS_MERKLE)
         # FORS: k leaves, k*a auth path nodes, 1 root compression
         h_fts = k + k*a + 1
-        c_fts = k*C_Th1 + k*a*C_Th2 + Thk
+        gas_fts = k*gas_th1 + k*a*gas_th2 + gas_thk
 
     # Total: Hmsg + FTS + d*WOTS + h auth path nodes
     return {
         'hashes': 1 + h_fts + d*h_wots + h,
-        'compressions': C_Hmsg + c_fts + d*c_wots + h*C_Th2,
+        'keccak_gas': gas_hmsg + gas_fts + d*gas_wots + h*gas_th2,
     }
+
+def compute_keygen_cost(h, d, a, k, w, scheme):
+    """
+    Estimate keygen cost in keccak calls and keccak gas.
+
+    This models on-device public-root generation from the secret seed.
+
+    - For WOTS-based schemes with d=1, this is the single XMSS tree root.
+    - For WOTS-based schemes with d>1, this is the top-layer XMSS root only.
+      Lower-layer material is assumed to be derived lazily during signing.
+    - FORS_MERKLE is only defined for d=1 and models the full Merkle root.
+    """
+    if scheme == "FORS_MERKLE":
+        assert d == 1, "FORS_MERKLE assumes d=1"
+        gas_th1 = evm_keccak_gas(th_bytes(1))
+        gas_th2 = evm_keccak_gas(th_bytes(2))
+        gas_prf = evm_keccak_gas(prf_bytes())
+        gas_thk = evm_keccak_gas(th_bytes(k))
+
+        h_fors_pk = k*(2**a) + k*(2**a) + k*(2**a - 1) + 1
+        gas_fors_pk = k*(2**a)*gas_prf + k*(2**a)*gas_th1 + k*(2**a - 1)*gas_th2 + gas_thk
+        h_merkle = 2**h * h_fors_pk + (2**h - 1)
+        gas_merkle = 2**h * gas_fors_pk + (2**h - 1) * gas_th2
+        return {'hashes': h_merkle, 'keccak_gas': gas_merkle}
+
+    l = compute_wots_l(scheme, w)
+    gas_th1 = evm_keccak_gas(th_bytes(1))
+    gas_th2 = evm_keccak_gas(th_bytes(2))
+    gas_prf = evm_keccak_gas(prf_bytes())
+    gas_thl = evm_keccak_gas(th_bytes(l)) if l > 0 else 0
+
+    h_tree = h if d == 1 else h // d
+    leaves = 2**h_tree
+    h_merkle = leaves * (l + l*(w-1) + 1) + (leaves - 1)
+    gas_merkle = leaves * (l*gas_prf + l*(w-1)*gas_th1 + gas_thl) + (leaves - 1)*gas_th2
+    return {'hashes': h_merkle, 'keccak_gas': gas_merkle}
 
 # =============================================================================
 # CSV Output
@@ -478,10 +732,13 @@ def compute_all_results():
         security = compute_security(2**q_s, h, k, a, scheme_type)
         assert security >= 128, f"Security {security:.1f} < 128 for {scheme} q_s=2^{q_s} h={h} a={a} k={k}"
 
-        sign = compute_signing_time(h, d, a, k, w, swn, scheme)
+        sign = compute_signing_time(h, d, a, k, w, swn, scheme, include_worst=True)
         verify = compute_verification_time(h, d, a, k, w, swn, scheme, sign['mmax'])
         size = compute_size(h, d, a, k, w, scheme, sign['mmax'])
-        compressions_per_byte = float(verify['compressions']) / float(size)
+        calldata_zero_bytes = int(size * DEFAULT_CALLDATA_ZERO_FRACTION)
+        gas_model = compute_total_verify_gas(size, verify['keccak_gas'], zero_bytes=calldata_zero_bytes)
+        keccak_gas_per_byte = float(verify['keccak_gas']) / float(size)
+        keygen = compute_keygen_cost(h, d, a, k, w, scheme)
 
         results.append({
             'scheme': scheme,
@@ -495,24 +752,310 @@ def compute_all_results():
             'swn': swn,
             'size': size,
             'sign_hashes': sign['hashes'],
-            'sign_compressions': sign['compressions'],
+            'sign_keccak_gas': sign['keccak_gas'],
             'exp_search': sign['exp_search'],
             'worst_search': sign['worst_search'],
             'verify_hashes': verify['hashes'],
-            'verify_compressions': verify['compressions'],
-            'compressions_per_byte': compressions_per_byte,
+            'verify_keccak_gas': verify['keccak_gas'],
+            'keccak_gas_per_byte': keccak_gas_per_byte,
+            **gas_model,
+            'sign_seconds': estimate_time_seconds(sign['hashes']),
+            'verify_seconds': estimate_time_seconds(verify['hashes']),
+            'keygen_seconds': estimate_time_seconds(keygen['hashes']) if keygen['hashes'] else 0.0,
             'bold': bold,
         })
     return results
 
 
+# =============================================================================
+# EVM-focused search helpers
+# =============================================================================
+
+_SECURITY_CACHE = {}
+
+def security_cached(q_s, h, k, a, scheme_type):
+    key = (q_s, h, k, a, scheme_type)
+    if key not in _SECURITY_CACHE:
+        _SECURITY_CACHE[key] = compute_security(q_s, h, k, a, scheme_type)
+    return _SECURITY_CACHE[key]
+
+def scheme_security_type(scheme):
+    """Map table scheme name to the security model used by security.sage."""
+    return "PORS+FP" if scheme == "W+C_P+FP" else "FORS"
+
+def add_security_report(rows, report_log_qs, tuned_log_qs):
+    """Annotate already-selected rows with security at the requested signature counts."""
+    for row in rows:
+        scheme_type = scheme_security_type(row['scheme'])
+        for q in report_log_qs:
+            if q == tuned_log_qs and 'sec_tuned' in row:
+                row[f'sec_{q}'] = row['sec_tuned']
+            else:
+                row[f'sec_{q}'] = security_cached(2**q, row['h'], row['k'], row['a'], scheme_type)
+    return rows
+
+def search_evm_candidates(
+    target_security_bits=128,
+    tuned_log_qs=20,
+    report_log_qs=(16, 20, 30),
+    gas_limit=350_000,
+    sign_time_limit=2.0,
+    verify_time_limit=2.0,
+    min_h_d1=12,
+    max_h_d1=21,
+    min_h_other=12,
+    max_h_other=40,
+    d_values=(1, 2, 3, 4, 5, 6),
+    a_values=tuple(range(8, 21)),
+    k_values=tuple(range(4, 25)),
+    w_values=(16, 32, 256),
+    max_rows=20,
+    scheme_names=("W+C", "W+C_F+C", "W+C_P+FP", "SPX", "FORS_MERKLE"),
+    force_schemes=("W+C_P+FP", "W+C", "FORS_MERKLE"),
+    keccaks_per_sec=DEFAULT_KECCAKS_PER_SEC,
+):
+    """
+    Search for candidate parameter sets under EVM constraints.
+    Returns a list of dicts sorted by total gas then size.
+    """
+    tuned_qs = 2**tuned_log_qs
+
+    wots_swn = {
+        16: [240],
+        32: [403],
+        256: [2040, 2840],
+    }
+
+    # Include size-focused variants (WOTS+C, FORS+C, PORS+FP) alongside SPX and FORS-only.
+    schemes = [
+        ("W+C", True),
+        ("W+C_F+C", True),
+        ("W+C_P+FP", True),
+        ("SPX", True),
+        ("FORS_MERKLE", False),
+    ]
+    schemes = [entry for entry in schemes if entry[0] in set(scheme_names)]
+
+    results = []
+
+    for scheme, has_wots in schemes:
+        for d in d_values:
+            if d == 1:
+                h_values = range(min_h_d1, max_h_d1 + 1)
+            else:
+                h_values = range(min_h_other, max_h_other + 1)
+            for h in h_values:
+                if has_wots and h % d != 0:
+                    continue
+                for a in a_values:
+                    for k in k_values:
+                        if has_wots:
+                            for w in w_values:
+                                swn_list = wots_swn[w] if scheme != "SPX" else [0]
+                                for swn in swn_list:
+                                    scheme_type = scheme_security_type(scheme)
+                                    try:
+                                        sign = compute_signing_time(h, d, a, k, w, swn, scheme, include_worst=False)
+                                        verify = compute_verification_time(h, d, a, k, w, swn, scheme, sign['mmax'])
+                                        size = compute_size(h, d, a, k, w, scheme, sign['mmax'])
+                                    except (ValueError, RuntimeError):
+                                        continue
+
+                                    calldata_zero_bytes = int(size * DEFAULT_CALLDATA_ZERO_FRACTION)
+                                    gas_model = compute_total_verify_gas(size, verify['keccak_gas'], zero_bytes=calldata_zero_bytes)
+                                    total_gas = gas_model['total_verify_gas']
+
+                                    sign_s = estimate_time_seconds(sign['hashes'], keccaks_per_sec)
+                                    verify_s = estimate_time_seconds(verify['hashes'], keccaks_per_sec)
+                                    if sign_s > sign_time_limit or verify_s > verify_time_limit:
+                                        continue
+                                    if total_gas > gas_limit:
+                                        continue
+                                    sec_tuned = security_cached(tuned_qs, h, k, a, scheme_type)
+                                    if sec_tuned < target_security_bits:
+                                        continue
+
+                                    keygen = compute_keygen_cost(h, d, a, k, w, scheme)
+                                    keygen_s = estimate_time_seconds(keygen['hashes'], keccaks_per_sec) if keygen['hashes'] else 0.0
+
+                                    results.append({
+                                        'scheme': scheme,
+                                        'h': h,
+                                        'd': d,
+                                        'a': a,
+                                        'k': k,
+                                        'w': w,
+                                        'l': compute_wots_l(scheme, w),
+                                        'swn': swn,
+                                        'size': size,
+                                        'sign_seconds': sign_s,
+                                        'verify_seconds': verify_s,
+                                        'verify_keccak_gas': verify['keccak_gas'],
+                                        **gas_model,
+                                        'sec_tuned': sec_tuned,
+                                        'keygen_seconds': keygen_s,
+                                        'mmax': sign['mmax'],
+                                    })
+                        else:
+                            if scheme == "FORS_MERKLE" and d != 1:
+                                continue
+                            scheme_type = scheme_security_type(scheme)
+
+                            w = 0
+                            swn = 0
+                            try:
+                                sign = compute_signing_time(h, d, a, k, w, swn, scheme, include_worst=False)
+                                verify = compute_verification_time(h, d, a, k, w, swn, scheme, sign['mmax'])
+                                size = compute_size(h, d, a, k, w, scheme, sign['mmax'])
+                            except (ValueError, RuntimeError):
+                                continue
+
+                            calldata_zero_bytes = int(size * DEFAULT_CALLDATA_ZERO_FRACTION)
+                            gas_model = compute_total_verify_gas(size, verify['keccak_gas'], zero_bytes=calldata_zero_bytes)
+                            total_gas = gas_model['total_verify_gas']
+
+                            sign_s = estimate_time_seconds(sign['hashes'], keccaks_per_sec)
+                            verify_s = estimate_time_seconds(verify['hashes'], keccaks_per_sec)
+                            if sign_s > sign_time_limit or verify_s > verify_time_limit:
+                                continue
+                            if total_gas > gas_limit:
+                                continue
+                            sec_tuned = security_cached(tuned_qs, h, k, a, scheme_type)
+                            if sec_tuned < target_security_bits:
+                                continue
+
+                            keygen = compute_keygen_cost(h, d, a, k, w, scheme)
+                            keygen_s = estimate_time_seconds(keygen['hashes'], keccaks_per_sec) if keygen['hashes'] else 0.0
+
+                            results.append({
+                                'scheme': scheme,
+                                'h': h,
+                                'd': d,
+                                'a': a,
+                                'k': k,
+                                'w': w,
+                                'l': 0,
+                                'swn': 0,
+                                'size': size,
+                                'sign_seconds': sign_s,
+                                'verify_seconds': verify_s,
+                                'verify_keccak_gas': verify['keccak_gas'],
+                                **gas_model,
+                                'sec_tuned': sec_tuned,
+                                'keygen_seconds': keygen_s,
+                                'mmax': sign['mmax'],
+                            })
+
+    results.sort(key=lambda r: (r['total_verify_gas'], r['size'], r['verify_seconds']))
+
+    if not force_schemes:
+        return results[:max_rows]
+
+    forced = []
+    forced_keys = set()
+    for scheme in force_schemes:
+        for r in results:
+            if r['scheme'] == scheme:
+                key = (r['scheme'], r['h'], r['d'], r['a'], r['k'], r['w'], r['swn'])
+                if key not in forced_keys:
+                    forced.append(r)
+                    forced_keys.add(key)
+                break
+
+    remaining = []
+    for r in results:
+        key = (r['scheme'], r['h'], r['d'], r['a'], r['k'], r['w'], r['swn'])
+        if key in forced_keys:
+            continue
+        remaining.append(r)
+
+    combined = forced + remaining
+    return combined[:max_rows]
+
+def generate_research_table(max_rows=20, force_schemes=("W+C_P+FP", "W+C", "FORS_MERKLE")):
+    """Generate a table of EVM-oriented candidate parameter sets."""
+    tuned_log_qs = env_int("RESEARCH_TUNED_LOG_QS", 20)
+    report_log_qs = env_int_tuple("RESEARCH_SECURITY_LOGS", (16, 20, 30))
+    search_kwargs = {
+        'max_rows': env_int("RESEARCH_MAX_ROWS", max_rows),
+        'force_schemes': env_str_tuple("RESEARCH_FORCE_SCHEMES", force_schemes),
+        'sign_time_limit': env_float("RESEARCH_SIGN_TIME_LIMIT", 2.0),
+        'verify_time_limit': env_float("RESEARCH_VERIFY_TIME_LIMIT", 2.0),
+        'gas_limit': env_int("RESEARCH_GAS_LIMIT", 350_000),
+        'min_h_d1': env_int("RESEARCH_MIN_H_D1", 12),
+        'max_h_d1': env_int("RESEARCH_MAX_H_D1", 21),
+        'min_h_other': env_int("RESEARCH_MIN_H_OTHER", 12),
+        'max_h_other': env_int("RESEARCH_MAX_H_OTHER", 40),
+        'd_values': env_int_tuple("RESEARCH_D_VALUES", (1, 2, 3, 4, 5, 6)),
+        'a_values': tuple(range(env_int("RESEARCH_A_MIN", 8), env_int("RESEARCH_A_MAX", 20) + 1)),
+        'k_values': tuple(range(env_int("RESEARCH_K_MIN", 4), env_int("RESEARCH_K_MAX", 24) + 1)),
+        'w_values': env_int_tuple("RESEARCH_W_VALUES", (16, 32, 256)),
+        'scheme_names': env_str_tuple("RESEARCH_SCHEMES", ("W+C", "W+C_F+C", "W+C_P+FP", "SPX", "FORS_MERKLE")),
+        'tuned_log_qs': tuned_log_qs,
+        'report_log_qs': report_log_qs,
+        'target_security_bits': env_float("RESEARCH_TARGET_SECURITY", 128),
+    }
+    rows = search_evm_candidates(**search_kwargs)
+    if not rows:
+        print("No candidates found under current constraints.")
+        return
+    rows = add_security_report(rows, report_log_qs, tuned_log_qs)
+
+    print()
+    print(f"EVM constraints: {calldata_model_label(DEFAULT_CALLDATA_MODEL)}, Keccak-only hash model, n=16")
+    print(f"Assumptions: KECCAKS_PER_SEC={DEFAULT_KECCAKS_PER_SEC:,.0f}, CALLDATA_ZERO_FRACTION={DEFAULT_CALLDATA_ZERO_FRACTION:.2f}")
+    print(f"Search: schemes={search_kwargs['scheme_names']}, d={search_kwargs['d_values']}, sign<= {search_kwargs['sign_time_limit']:.2f}s, verify<= {search_kwargs['verify_time_limit']:.2f}s, gas<= {search_kwargs['gas_limit']}")
+    print(f"Ranges: h_d1=[{search_kwargs['min_h_d1']},{search_kwargs['max_h_d1']}], h_other=[{search_kwargs['min_h_other']},{search_kwargs['max_h_other']}], a={search_kwargs['a_values']}, k={search_kwargs['k_values']}, w={search_kwargs['w_values']}")
+    print(f"Security columns: {tuple(f'2^{q}' for q in report_log_qs)}")
+    print()
+
+    columns = [
+        ("Scheme", 'scheme', 12, str),
+        ("h", 'h', 3, str),
+        ("d", 'd', 3, str),
+        ("a", 'a', 3, str),
+        ("k", 'k', 3, str),
+        ("w", 'w', 4, str),
+        ("Size", 'size', 6, str),
+        ("Sign(s)", 'sign_seconds', 7, lambda x: f"{x:.2f}"),
+        ("Verify(s)", 'verify_seconds', 9, lambda x: f"{x:.2f}"),
+        ("Gas", 'total_verify_gas', 8, format_num),
+        ("Path", 'gas_path', 6, str),
+        ("Floor", 'calldata_floor_gas', 8, format_num),
+        ("StdData", 'standard_calldata_gas', 8, format_num),
+        ("Compute", 'verify_keccak_gas', 8, format_num),
+        ("Keygen(s)", 'keygen_seconds', 9, lambda x: f"{x:.2f}"),
+    ]
+    sec_columns = [(f"Sec@2^{q}", f"sec_{q}", 9, lambda x: f"{x:.1f}") for q in report_log_qs]
+    columns = columns[:12] + sec_columns + columns[12:]
+
+    total_width = sum(w for _, _, w, _ in columns) + len(columns) - 1
+    header_line = " ".join(h.center(w) for h, _, w, _ in columns)
+    print("=" * total_width)
+    print(header_line)
+    print("-" * total_width)
+
+    for r in rows:
+        row_parts = []
+        for _, key, width, fmt in columns:
+            val = fmt(r[key])
+            row_parts.append(val.rjust(width) if key != 'scheme' else val.ljust(width))
+        print(" ".join(row_parts))
+
+    print()
+    print(f"Legend: Gas excludes 21k base tx cost and memory expansion; {gas_formula_legend(DEFAULT_CALLDATA_MODEL)}")
+    if search_kwargs['force_schemes']:
+        present = {r['scheme'] for r in rows}
+        missing = [s for s in search_kwargs['force_schemes'] if s not in present]
+        if missing:
+            print(f"Note: No candidates found for forced schemes under current constraints: {', '.join(missing)}")
 def generate_csv():
     """Generate CSV output for all parameter sets."""
-    print("scheme,q_s,h,d,a,k,w,l,paramsum,size,sign_hashes,sign_compressions,exp_search,worst_search,verify_hashes,verify_compressions,compressions_per_byte,bold")
+    print("scheme,q_s,h,d,a,k,w,l,paramsum,size,sign_hashes,sign_keccak_gas,exp_search,worst_search,verify_hashes,verify_keccak_gas,keccak_gas_per_byte,calldata_model,gas_path,standard_calldata_gas,calldata_floor_gas,calldata_gas,total_verify_gas,sign_seconds,verify_seconds,keygen_seconds,bold")
 
     for r in compute_all_results():
         bold_str = "True" if r['bold'] else "False"
-        print(f"{r['scheme']},2^{r['q_s']},{r['h']},{r['d']},{r['a']},{r['k']},{r['w']},{r['l']},{r['swn']},{r['size']},{r['sign_hashes']},{r['sign_compressions']},{r['exp_search']},{r['worst_search']},{r['verify_hashes']},{r['verify_compressions']},{r['compressions_per_byte']:.2f},{bold_str}")
+        print(f"{r['scheme']},2^{r['q_s']},{r['h']},{r['d']},{r['a']},{r['k']},{r['w']},{r['l']},{r['swn']},{r['size']},{r['sign_hashes']},{r['sign_keccak_gas']},{r['exp_search']},{r['worst_search']},{r['verify_hashes']},{r['verify_keccak_gas']},{r['keccak_gas_per_byte']:.2f},{r['calldata_model']},{r['gas_path']},{r['standard_calldata_gas']},{r['calldata_floor_gas']},{r['calldata_gas']},{r['total_verify_gas']},{r['sign_seconds']:.4f},{r['verify_seconds']:.4f},{r['keygen_seconds']:.4f},{bold_str}")
 
 
 def format_num(n):
@@ -548,7 +1091,7 @@ def generate_table(q_s_filter=None):
 
     # Column definitions: (header, key, width, format_func)
     columns = [
-        ("Scheme", 'scheme', 10, str),
+        ("Scheme", 'scheme', 12, str),
         ("h", 'h', 4, str),
         ("d", 'd', 3, str),
         ("a", 'a', 3, str),
@@ -557,9 +1100,13 @@ def generate_table(q_s_filter=None):
         ("l", 'l', 3, str),
         ("S_wn", 'swn', 5, str),
         ("Size", 'size', 6, str),
-        ("Sign(C)", 'sign_compressions', 9, format_num),
-        ("Verify(C)", 'verify_compressions', 10, format_num),
-        ("C/byte", 'compressions_per_byte', 6, lambda x: f"{x:.2f}"),
+        ("SignGas", 'sign_keccak_gas', 9, format_num),
+        ("VerifyGas", 'verify_keccak_gas', 10, format_num),
+        ("Path", 'gas_path', 6, str),
+        ("Floor", 'calldata_floor_gas', 9, format_num),
+        ("StdData", 'standard_calldata_gas', 9, format_num),
+        ("TotalGas", 'total_verify_gas', 9, format_num),
+        ("Gas/byte", 'keccak_gas_per_byte', 8, lambda x: f"{x:.2f}"),
     ]
 
     # Calculate total width
@@ -588,7 +1135,7 @@ def generate_table(q_s_filter=None):
             print(" ".join(row_parts))
 
     print()
-    print("Legend: Size=bytes, Sign(C)/Verify(C)=compression calls, C/byte=verify compressions per signature byte")
+    print(f"Legend: Size=bytes. Gas columns exclude 21k base tx cost and memory expansion; {gas_formula_legend(DEFAULT_CALLDATA_MODEL)}")
 
 
 # =============================================================================
@@ -602,13 +1149,19 @@ if __name__ == "__main__":
         # Optional: --table 40 to filter by q_s
         q_s_filter = int(sys.argv[2]) if len(sys.argv) > 2 else None
         generate_table(q_s_filter)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--research":
+        # Optional: --research N to limit rows
+        max_rows = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+        generate_research_table(max_rows)
     elif len(sys.argv) > 1 and sys.argv[1] == "--help":
-        print("Usage: sage costs.sage [--table [q_s]]")
+        print("Usage: sage costs.sage [--table [q_s]] [--research [N]]")
         print()
         print("Options:")
         print("  (no args)      Output CSV format")
         print("  --table        Output pretty ASCII table")
         print("  --table N      Output table filtered to 2^N signatures (e.g., --table 40)")
+        print("  --research     Search EVM-oriented candidates")
+        print("  --research N   Limit research table to N rows")
         print("  --help         Show this help message")
     else:
         generate_csv()

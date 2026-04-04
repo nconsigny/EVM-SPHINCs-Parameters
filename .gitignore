@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+*.sage.py
+Miniforge3-Linux-x86_64.sh
