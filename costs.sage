@@ -97,6 +97,8 @@ def evm_keccak_gas(byte_len):
 
 def calldata_token_counts(size_bytes, zero_bytes=0):
     """Return zero bytes, non-zero bytes, and EIP-7623 tokens."""
+    if size_bytes < 0:
+        raise ValueError("size_bytes must be nonnegative")
     zero_bytes = max(0, min(int(zero_bytes), int(size_bytes)))
     nonzero = int(size_bytes) - zero_bytes
     tokens = zero_bytes + 4 * nonzero
@@ -329,8 +331,10 @@ def compute_nu(l: int, paramsum: int, w: int) -> int:
 
         ν = Σ_{j=0}^{l} (-1)^j * C(l,j) * C((S_{w,n} + l) - j*w - 1, l-1)
 
-    Returns integer ν. If ν is zero, returns 1 and prints a warning.
+    Returns integer ν. Rejects parameters with no digit encoding instead of fabricating a count.
     """
+    if l < 1 or w < 2 or not 0 <= paramsum <= l * (w - 1):
+        raise ValueError("No digit encoding exists for these parameters")
     nu = 0
     for j in range(l + 1):
         sign = (-1) ** j
@@ -339,8 +343,7 @@ def compute_nu(l: int, paramsum: int, w: int) -> int:
         binom2 = binomial(n, l - 1) if n >= l - 1 and l - 1 >= 0 else 0
         nu += sign * binom1 * binom2
     if nu == 0:
-        print(f"Warning: ν computed as zero for l={l}, paramsum={paramsum}, w={w}. This may lead to division by zero.")
-        nu = 1  # Avoid division by zero
+        raise ValueError("Digit encoding count is zero")
     return nu
 
 # -----------------------------------------------------------------------------
